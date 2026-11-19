@@ -1,3 +1,21 @@
+// Size classes for small blocks:
+//   linear classes:  16, 32, 48, ..., 1024          (indices 0 .. linear_class_count-1)
+//   pow2 classes:    2048, 4096, ..., small_max     (indices linear_class_count .. class_count-1)
+// Anything bigger than `small_max` is mmap'ed directly.
+
+// Chosen values (TESTS ARE HARDCODED FOR THOSE VALUES, UPDATE THEM)
+const class_step: usize = 16;
+const linear_class_count: usize = 64;
+const pow2_class_count: usize = 8;
+
+// Derived values:
+const linear_max: usize = class_step * linear_class_count; // 1024
+const class_count: usize = linear_class_count + pow2_class_count; // 72
+const small_max: usize = linear_max << pow2_class_count; // 262144
+
+// The first pow2 class (linear_max * 2) must land on index `linear_class_count`.
+const pow2_class_offset: usize = linear_class_count - (std.math.log2_int_ceil(usize, linear_max) + 1); // 53
+
 const std = @import("std");
 const linux = std.os.linux;
 const max_align = @alignOf(std.c.max_align_t);
@@ -6,7 +24,6 @@ const Heap = @This();
 
 const Header = extern struct {
     size: usize align(max_align),
-    is_free: bool,
     next: ?*Header,
     pub fn payload(self: *Header) [*]u8 {
         return @ptrCast(@as([*]Header, @ptrCast(self)) + 1);
@@ -23,12 +40,35 @@ comptime {
     if (@alignOf(Header) != max_align) {
         @compileError(std.fmt.comptimePrint("Header alignment must be {d}", .{max_align}));
     }
+    if (class_step % max_align != 0) {
+        @compileError(std.fmt.comptimePrint("Minimall alignment step heap is not aligned with {d}", .{max_align}));
+    }
 }
 
 current_brk: usize = 0,
-head: ?*Header = null,
-tail: ?*Header = null,
 mutex: std.atomic.Mutex = .unlocked,
+
+free_blocks: [class_count]?*Header = @splat(null),
+
+fn getId(_: *Heap, size: usize) ?usize {
+    if (size > small_max) {
+        return null;
+    } else if (size <= linear_max) {
+        if (size == 0) return 0;
+        return (size + class_step - 1) / class_step - 1;
+    } else {
+        return std.math.log2_int_ceil(usize, size) + pow2_class_offset;
+    }
+}
+
+fn classSize(_: *Heap, id: usize) usize {
+    if (id < linear_class_count) {
+        return id * class_step + class_step;
+    } else {
+        return std.math.shl(usize, 1, id - pow2_class_offset);
+    }
+}
+
 const max_size: usize = std.math.maxInt(isize) - @sizeOf(Header) - (max_align - 1);
 
 fn sbrk(self: *Heap, increment: isize) error{OutOfMemory}![*]u8 {
@@ -45,14 +85,12 @@ fn sbrk(self: *Heap, increment: isize) error{OutOfMemory}![*]u8 {
     return @ptrFromInt(old);
 }
 
-fn get_free_block(self: *Heap, size: usize) ?*Header {
-    var curr = self.head;
-    while (curr) |node| {
-        if (node.is_free and node.size >= size)
-            return node;
-        curr = node.next;
-    }
-    return null;
+fn getFreeBlock(self: *Heap, size: usize) ?*Header {
+    const id = self.getId(size) orelse return null;
+    const node: *Header = self.free_blocks[id] orelse return null;
+    self.free_blocks[id] = node.next;
+    node.next = null;
+    return node;
 }
 
 fn lock(self: *Heap) void {
@@ -65,51 +103,66 @@ fn unlock(self: *Heap) void {
 
 pub fn alloc(self: *Heap, requested: usize) error{OutOfMemory}![*]u8 {
     if (requested > max_size) return error.OutOfMemory;
-    const size = std.mem.alignForward(usize, requested, max_align);
+    if (requested <= small_max) {
+        self.lock();
+        defer self.unlock();
+        const header = self.getFreeBlock(requested) orelse {
+            const header = try self.allocSmall(requested);
+            return header.payload();
+        };
+        return header.payload();
+    } else {
+        const header = try allocBig(requested);
+        return header.payload();
+    }
+}
+
+fn allocSmall(self: *Heap, requested: usize) error{OutOfMemory}!*Header {
+    const size = self.classSize(self.getId(requested).?);
+    const block = try self.sbrk(@intCast(size + @sizeOf(Header)));
+    const header: *Header = @ptrCast(@alignCast(block));
+    header.size = size;
+    return header;
+}
+
+fn freeSmall(self: *Heap, header: *Header, size: usize) void {
     self.lock();
     defer self.unlock();
-    const header = self.get_free_block(size) orelse {
-        const total_size = @sizeOf(Header) + size;
-        const block = try self.sbrk(@intCast(total_size));
-        const header: *Header = @ptrCast(@alignCast(block));
-        header.*.size = size;
-        header.*.is_free = false;
-        header.*.next = null;
-        if (self.head == null)
-            self.head = header;
-        if (self.tail) |t|
-            t.*.next = header;
-        self.tail = header;
-        return header.payload();
-    };
-    header.*.is_free = false;
-    return header.payload();
+    const id = self.getId(size).?;
+    const node = self.free_blocks[id];
+    self.free_blocks[id] = header;
+    header.*.next = node;
+}
+
+// Large blocks get one extra page in front; the header sits at the end of that page,
+// so the payload always starts on a page boundary:
+//
+//   | ...unused... | Header | payload ............ |
+//   ^ mapping start         ^ page boundary
+fn allocBig(requested: usize) error{OutOfMemory}!*Header {
+    const page = std.heap.pageSize();
+    const len = page + std.mem.alignForward(usize, requested, page);
+    const block = std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return error.OutOfMemory;
+    const header: *Header = @ptrCast(@alignCast(block.ptr + page - @sizeOf(Header)));
+    header.size = block.len - page;
+    return header;
+}
+
+fn freeBig(header: *Header) void {
+    const page = std.heap.pageSize();
+    const start = @intFromPtr(header) + @sizeOf(Header) - page;
+    const base: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(start);
+    std.posix.munmap(base[0 .. header.size + page]);
 }
 
 pub fn free(self: *Heap, block: [*]u8) void {
-    self.lock();
-    defer self.unlock();
     const header: *Header = Header.fromPayload(block);
-
-    if (@intFromPtr(block) + header.*.size == self.current_brk) {
-        if (self.head == self.tail) {
-            self.head = null;
-            self.tail = null;
-        } else {
-            var tmp = self.head;
-            while (tmp) |node| {
-                if (node.next == self.tail) {
-                    node.next = null;
-                    self.tail = tmp;
-                }
-                tmp = node.next;
-            }
-        }
-        const block_size = @as(isize, @intCast(@sizeOf(Header) + header.*.size));
-        _ = self.sbrk(-block_size) catch return;
-        return;
+    const size = header.size;
+    if (size <= small_max) {
+        self.freeSmall(header, size);
+    } else {
+        freeBig(header);
     }
-    header.*.is_free = true;
 }
 
 pub fn calloc(self: *Heap, num: usize, nsize: usize) error{OutOfMemory}![*]u8 {
@@ -132,30 +185,24 @@ pub fn allocAligned(self: *Heap, alignment: usize, requested: usize) error{OutOf
     if (requested > max_size) return error.OutOfMemory;
     if (alignment <= max_align) return self.alloc(requested);
     if (alignment >= (1 << 31)) return error.OutOfMemory;
-    const size = std.mem.alignForward(usize, requested, max_align);
-    self.lock();
-    defer self.unlock();
+    if (requested <= small_max) {
+        const size = self.classSize(self.getId(requested).?);
+        self.lock();
+        defer self.unlock();
 
-    _ = try self.sbrk(0);
-    const padding = std.mem.alignForward(usize, self.current_brk + @sizeOf(Header), alignment) - (self.current_brk + @sizeOf(Header));
-    // const header = self.get_free_block(size) orelse {
-    const total_size = std.math.add(usize, @sizeOf(Header) + size, padding) catch return error.OutOfMemory;
-    const block = try self.sbrk(std.math.cast(isize, total_size) orelse return error.OutOfMemory);
-    const header: *Header = @ptrCast(@alignCast(block + padding));
-    header.*.size = size;
-    header.*.is_free = false;
-    header.*.next = null;
-    if (self.head == null)
-        self.head = header;
-    if (self.tail) |t| {
-        t.*.size += padding;
-        t.*.next = header;
+        _ = try self.sbrk(0);
+        const padding = std.mem.alignForward(usize, self.current_brk + @sizeOf(Header), alignment) - (self.current_brk + @sizeOf(Header));
+        const total_size = std.math.add(usize, @sizeOf(Header) + size, padding) catch return error.OutOfMemory;
+        const block = try self.sbrk(std.math.cast(isize, total_size) orelse return error.OutOfMemory);
+        const header: *Header = @ptrCast(@alignCast(block + padding));
+        header.*.size = size;
+        header.*.next = null;
+        return header.payload();
+    } else {
+        // mmap'ed payloads start on a page boundary, which covers any alignment up to a page.
+        if (alignment > std.heap.pageSize()) return error.OutOfMemory;
+        return (try allocBig(requested)).payload();
     }
-    self.tail = header;
-    return header.payload();
-    // };
-    // header.*.is_free = false;
-    // return header.payload();
 }
 
 pub fn usableSize(_: *Heap, block: [*]u8) usize {
@@ -229,4 +276,19 @@ test "set alignment" {
         const ptr = try heap.allocAligned(allign, size);
         try std.testing.expectEqual(0, @intFromPtr(ptr) % allign);
     }
+}
+
+test "size -> id -> size" {
+    var heap: Heap = .{};
+    const input_sizes = [_]usize{ 0, 1, 17, 39, linear_max - 1 };
+    const ids = [_]usize{ 0, 0, 1, 2, linear_class_count - 1 };
+    const output_sizes = [_]usize{ 16, 16, 32, 48, linear_max };
+
+    for (input_sizes, 0..) |size, i| {
+        const id = ids[i];
+        try std.testing.expectEqual(heap.getId(size).?, id);
+        try std.testing.expectEqual(heap.classSize(id), output_sizes[i]);
+    }
+
+    try std.testing.expectEqual(null, heap.getId(small_max + 1));
 }
